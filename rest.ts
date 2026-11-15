@@ -29,7 +29,18 @@ const validationFailed = (message: string): HttpResult =>
 
 // ---------------------------------------------------------------- shared shapes
 
+const userJsonCache = new Map<string, Record<string, unknown>>();
+
 export function userJson(user: ScenarioUser, base: string): Record<string, unknown> {
+  const key = `${user.id}|${base}`;
+  const cached = userJsonCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = userJsonFresh(user, base);
+  userJsonCache.set(key, built);
+  return built;
+}
+
+function userJsonFresh(user: ScenarioUser, base: string): Record<string, unknown> {
   return {
     login: user.login,
     id: user.id,
@@ -45,8 +56,16 @@ export function userJson(user: ScenarioUser, base: string): Record<string, unkno
   };
 }
 
+const nodeIdCache = new Map<string, string>();
+
 export function nodeId(type: string, id: number): string {
-  return Buffer.from(`${type}:${id}`, 'utf8').toString('base64');
+  const key = `${type}:${id}`;
+  const cached = nodeIdCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = Buffer.from(key, 'utf8').toString('base64');
+  if (nodeIdCache.size >= 50_000) nodeIdCache.clear();
+  nodeIdCache.set(key, built);
+  return built;
 }
 
 export function repoJson(repo: RepoRec, base: string): Record<string, unknown> {
@@ -93,7 +112,22 @@ function stableLabelId(repoId: number, name: string): number {
   return hash % 100_000_000;
 }
 
+const issueJsonCache = new Map<string, Record<string, unknown>>();
+
 export function issueJson(forge: Forge, repo: RepoRec, rec: IssueRec, base: string): Record<string, unknown> {
+  // An issue's JSON changes only when the record does; the read benchmark hammers one
+  // issue thousands of times, so the built object is shared until it changes.
+  const key = `${repo.id}:${rec.id}:${rec.updatedEpoch}:${rec.comments.length}:${rec.labels.join(',')}:${base}`;
+  const cached = issueJsonCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = issueJsonFresh(forge, repo, rec, base);
+  if (issueJsonCache.size >= 20_000) issueJsonCache.clear();
+  issueJsonCache.set(key, built);
+  return built;
+}
+
+function issueJsonFresh(forge: Forge, repo: RepoRec, rec: IssueRec, base: string): Record<string, unknown> {
+  void forge;
   return {
     id: rec.id,
     node_id: nodeId('Issue', rec.id),

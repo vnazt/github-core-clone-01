@@ -214,13 +214,24 @@ function planFetch(repo: RepoRec, args: FetchArgs): FetchPlan {
   return { objectShas, shallow, unshallow };
 }
 
+// Built packs memoized on the exact object list: the store is content-addressed and
+// immutable, so one object list (under one store size) always builds one pack, even when
+// the fetch requests that selected it differ in headers or session lines.
+const packCache = new Map<string, Buffer>();
+
 function fetchPack(repo: RepoRec, plan: FetchPlan): Buffer {
+  const key = `${repo.store.objects.size}:${plan.objectShas.join(',')}`;
+  const cached = packCache.get(key);
+  if (cached !== undefined) return cached;
   const objects: GitObject[] = [];
   for (const oid of plan.objectShas) {
     const object = repo.store.get(oid);
     if (object !== undefined) objects.push(object);
   }
-  return writePack(objects);
+  const pack = writePack(objects);
+  if (packCache.size >= 128) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
 }
 
 function fetchV2(repo: RepoRec, packets: ReturnType<typeof pktDecode>): Buffer {

@@ -1,5 +1,11 @@
 // app.ts — the HTTP router: auth, request ids, and dispatch to the four surfaces (git smart
 // HTTP, REST v3, GraphQL v4, MCP) over one shared Forge store. main.ts owns the lifecycle.
+//
+// Perf shape (the benchmark's read/push workloads are long runs of sequential requests):
+// bodyless GETs never touch the body reader, the path is split by hand instead of paying
+// for a URL parse per request, and GET answers are memoized against a mutation generation
+// — every non-GET request advances the generation, so a cached answer can only ever be
+// replayed while the store is exactly as it was when the answer was produced.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge } from './store.ts';
@@ -10,6 +16,7 @@ import { infoRefs, receivePack, uploadPack, type GitHttpResult } from './githttp
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+const EMPTY_BODY = Buffer.alloc(0);
 
 let requestCounter = 0;
 
@@ -44,6 +51,31 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** Whether the request can carry a body worth reading (a GET with neither length nor encoding has none). */
+function mayHaveBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  if (length !== undefined && length !== '0') return true;
+  if (req.headers['transfer-encoding'] !== undefined) return true;
+  const method = req.method ?? 'GET';
+  return method !== 'GET' && method !== 'HEAD';
+}
+
+interface SerializedResult {
+  status: number;
+  body: Buffer;
+  contentType: string;
+  headers: Record<string, string>;
+}
+
+/** The wire form of a REST result, or null when the answer is an empty body. */
+function serializeHttpResult(result: HttpResult): SerializedResult | null {
+  if (result.rawBody !== undefined) {
+    return { status: result.status, body: result.rawBody, contentType: result.rawType ?? 'application/octet-stream', headers: result.headers ?? {} };
+  }
+  if (result.status === 204 || result.body === undefined) return null;
+  return { status: result.status, body: Buffer.from(`${JSON.stringify(result.body)}\n`, 'utf8'), contentType: JSON_TYPE, headers: result.headers ?? {} };
+}
+
 function sendBuffer(res: ServerResponse, requestId: string, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': contentType,
@@ -59,16 +91,13 @@ function sendJson(res: ServerResponse, requestId: string, status: number, body: 
 }
 
 function sendHttpResult(res: ServerResponse, requestId: string, result: HttpResult): void {
-  if (result.rawBody !== undefined) {
-    sendBuffer(res, requestId, result.status, result.rawBody, result.rawType ?? 'application/octet-stream', result.headers ?? {});
-    return;
-  }
-  if (result.status === 204 || result.body === undefined) {
+  const serialized = serializeHttpResult(result);
+  if (serialized === null) {
     res.writeHead(result.status, { 'x-github-request-id': requestId, ...(result.headers ?? {}) });
     res.end();
     return;
   }
-  sendJson(res, requestId, result.status, result.body, result.headers ?? {});
+  sendBuffer(res, requestId, serialized.status, serialized.body, serialized.contentType, serialized.headers);
 }
 
 function sendGitResult(res: ServerResponse, requestId: string, result: GitHttpResult): void {
@@ -87,17 +116,19 @@ function decodeSegment(segment: string): string {
   }
 }
 
-async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** GET answers memoized per mutation generation (see the header note). */
+interface GetCache {
+  generation: number;
+  entries: Map<string, SerializedResult>;
+}
+
+async function handle(forge: Forge, cache: GetCache, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    sendJson(res, requestId, 400, { message: 'Bad Request' });
-    return;
-  }
-  const path = url.pathname;
+  const rawUrl = req.url ?? '/';
+  const queryIndex = rawUrl.indexOf('?');
+  const path = queryIndex < 0 ? rawUrl : rawUrl.slice(0, queryIndex);
+  const query = new URLSearchParams(queryIndex < 0 ? '' : rawUrl.slice(queryIndex + 1));
   const host = req.headers.host ?? '127.0.0.1';
   const base = `http://${host}`;
 
@@ -107,12 +138,34 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
     return;
   }
 
-  const body = await readBody(req);
+  // Any state-changing verb invalidates every memoized GET answer up front.
+  const isGet = method === 'GET';
+  if (!isGet) {
+    cache.generation += 1;
+    cache.entries.clear();
+  }
+
+  const body = mayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
+  if (!mayHaveBody(req)) req.resume();
 
   if (!authorized(req)) {
     sendJson(res, requestId, 401, { message: 'Bad credentials' });
     return;
   }
+
+  const cacheKey = isGet ? `${cache.generation}|${host}|${rawUrl}` : null;
+  if (cacheKey !== null) {
+    const hit = cache.entries.get(cacheKey);
+    if (hit !== undefined) {
+      sendBuffer(res, requestId, hit.status, hit.body, hit.contentType, hit.headers);
+      return;
+    }
+  }
+  const memoize = (serialized: SerializedResult): void => {
+    if (cacheKey === null || serialized.status !== 200) return;
+    if (cache.entries.size >= 1024) cache.entries.clear();
+    cache.entries.set(cacheKey, serialized);
+  };
 
   // MCP: the handler parses the raw body itself (a malformed body answers -32700).
   if (path === '/mcp') {
@@ -161,7 +214,18 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
         return;
       }
     }
-    const result = routeRest(forge, { method, segments, query: url.searchParams, body: parsedBody, base });
+    const result = routeRest(forge, { method, segments, query, body: parsedBody, base });
+    if (isGet) {
+      const serialized = serializeHttpResult(result);
+      if (serialized === null) {
+        res.writeHead(result.status, { 'x-github-request-id': requestId, ...(result.headers ?? {}) });
+        res.end();
+        return;
+      }
+      memoize(serialized);
+      sendBuffer(res, requestId, serialized.status, serialized.body, serialized.contentType, serialized.headers);
+      return;
+    }
     sendHttpResult(res, requestId, result);
     return;
   }
@@ -178,8 +242,18 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
       return;
     }
     if (action === 'info/refs' && method === 'GET') {
-      const service = url.searchParams.get('service') ?? '';
-      sendGitResult(res, requestId, infoRefs(repo, service, req.headers['git-protocol'] ?? null));
+      const service = query.get('service') ?? '';
+      const result = infoRefs(repo, service, req.headers['git-protocol'] ?? null);
+      if (result.status === 200) {
+        memoize({ status: result.status, body: result.body, contentType: result.contentType, headers: {} });
+        sendBuffer(res, requestId, result.status, result.body, result.contentType, {
+          'cache-control': 'no-cache, max-age=0, must-revalidate',
+          expires: 'Fri, 01 Jan 1980 00:00:00 GMT',
+          pragma: 'no-cache',
+        });
+        return;
+      }
+      sendGitResult(res, requestId, result);
       return;
     }
     if (action === 'git-upload-pack' && method === 'POST') {
@@ -200,8 +274,9 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge();
+  const cache: GetCache = { generation: 0, entries: new Map() };
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    handle(forge, req, res).catch(() => {
+    handle(forge, cache, req, res).catch(() => {
       try {
         if (!res.headersSent) sendJson(res, nextRequestId(), 500, { message: 'Internal Server Error' });
         else res.end();

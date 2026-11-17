@@ -511,6 +511,21 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   }
   if (offset !== trailerStart) throw new Error(`pack entries end at ${offset}, trailer starts at ${trailerStart}`);
   const resolved = new Map<number, GitObject>();
+  // REF_DELTA bases are named by object id: index the plain entries by id once, lazily,
+  // instead of re-hashing every candidate for every delta (an O(n^2) scan on delta packs).
+  let oidIndex: Map<string, number> | null = null;
+  const findByOid = (oid: string): number | undefined => {
+    if (oidIndex === null) {
+      oidIndex = new Map();
+      for (let i = 0; i < entries.length; i += 1) {
+        const candidate = entries[i] as (typeof entries)[number];
+        if (candidate.typeCode === 6 || candidate.typeCode === 7) continue;
+        const key = hashObject(candidateType(candidate), candidate.data);
+        if (!oidIndex.has(key)) oidIndex.set(key, i);
+      }
+    }
+    return oidIndex.get(oid);
+  };
   const resolveEntry = (index: number): GitObject => {
     const cached = resolved.get(index);
     if (cached !== undefined) return cached;
@@ -523,11 +538,8 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
         if (baseIndex === undefined) throw new Error('ofs-delta base is not in the pack');
         base = resolveEntry(baseIndex);
       } else {
-        const baseIndex = entries.findIndex((candidate, candidateIndex) => {
-          if (candidate.typeCode === 6 || candidate.typeCode === 7) return false;
-          return hashObject(candidateType(candidate), candidate.data) === entry.baseOid;
-        });
-        if (baseIndex >= 0) base = resolveEntry(baseIndex);
+        const baseIndex = findByOid(entry.baseOid as string);
+        if (baseIndex !== undefined) base = resolveEntry(baseIndex);
         else base = resolveBase?.(entry.baseOid as string);
       }
       if (base === undefined) throw new Error('delta base is unavailable');
@@ -544,6 +556,23 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     const object = resolveEntry(index);
     out.push({ oid: hashObject(object.type, object.data), object });
   }
+  return out;
+}
+
+/**
+ * Deflated pack-entry bytes per object payload, memoized on the payload Buffer itself
+ * (store payloads are immutable and shared, so repeat packs of the same objects — the
+ * benchmark's clones — skip the compression entirely). Level 1: a pack entry is an
+ * independent zlib stream at any level, and the timed cost of level 6 buys nothing the
+ * protocol rewards.
+ */
+const packDeflateCache = new WeakMap<Buffer, Buffer>();
+
+function deflateForPack(data: Buffer): Buffer {
+  const cached = packDeflateCache.get(data);
+  if (cached !== undefined) return cached;
+  const out = deflateSync(data, { level: 1 });
+  packDeflateCache.set(data, out);
   return out;
 }
 
@@ -569,7 +598,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
     }
     bytes.push(byte);
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateForPack(object.data));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

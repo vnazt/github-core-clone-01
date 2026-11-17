@@ -198,11 +198,11 @@ function planFetch(repo: RepoRec, args: FetchArgs): FetchPlan {
     if (object?.type === 'blob') return [20_000, oid];
     return [30_000, oid];
   };
-  const objectShas = [...objects].sort((a, b) => {
-    const [ka, sa] = order(a);
-    const [kb, sb] = order(b);
-    return ka - kb || (sa < sb ? -1 : 1);
-  });
+  // Decorate once: the comparator's key does a store lookup per call, and a comparison
+  // sort calls it O(n log n) times.
+  const keyed = [...objects].map((oid) => ({ oid, key: order(oid) }));
+  keyed.sort((a, b) => a.key[0] - b.key[0] || (a.key[1] < b.key[1] ? -1 : 1));
+  const objectShas = keyed.map((entry) => entry.oid);
   const shallow = [...boundary].sort();
   const unshallow: string[] = [];
   if (args.shallowLines.length > 0) {
